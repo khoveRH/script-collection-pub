@@ -11,7 +11,7 @@ They're written for short-lived lab and reproduction clusters, but the diagnosti
 |---|---|---|
 | [`deploy-busybox-app.sh`](#deploy-busybox-appsh) | Workload | Deployment + PVC with a verified write loop. Supports RWO/RWX/RWOP, Filesystem/Block, and integrity checks. |
 | [`deploy-busybox-statefulset-app.sh`](#deploy-busybox-statefulset-appsh) | Workload | StatefulSet with per-pod or shared volumes, including shared raw block (VM-disk style). |
-| [`deploy-s3-workload.sh`](#deploy-s3-workloadsh) | Workload | Continuous S3 object writes to NooBaa (MCG) or Ceph RGW through an ObjectBucketClaim. |
+| [`deploy-s3-workload.sh`](#deploy-s3-workloadsh) | Workload | Parallel, bounded and verified S3 object writes to NooBaa (MCG) or Ceph RGW through an ObjectBucketClaim, with integrity checks. |
 | [`diagnose-app-rbd-iops-path.sh`](#diagnose-app-rbd-iops-pathsh) | Diagnostic | Layered I/O latency for an app pod on an RBD PVC: pod, node `/dev/rbdN`, Ceph, OSD disks. |
 | [`diagnose-app-cephfs-iops-path.sh`](#diagnose-app-cephfs-iops-pathsh) | Diagnostic | The same for CephFS PVCs, plus a check for SELinux relabeling risk. |
 | [`diagnose-vm-iops-path-v2.sh`](#diagnose-vm-iops-path-v2sh) | Diagnostic | Layered I/O latency for a KubeVirt VM on RBD: QEMU, node, Ceph, OSD disks. |
@@ -103,18 +103,28 @@ Both busybox scripts label their resources only with `app=<name>` and `app.kuber
 
 ### `deploy-s3-workload.sh`
 
-Deploys a pod that continuously writes objects to an S3 bucket and periodically prunes old ones. The bucket is provisioned through an **ObjectBucketClaim**, so the same script works against **NooBaa (MCG)** or **Ceph RGW**. The backend is chosen by auto-detecting the StorageClass, or by passing one explicitly.
+Deploys a StatefulSet that continuously writes objects to an S3 bucket. The bucket is provisioned through an **ObjectBucketClaim**, so the same script works against **NooBaa (MCG)** or **Ceph RGW**. The backend is chosen by auto-detecting the StorageClass, or by passing one explicitly.
+
+- **Write load.** Each pod runs `--workers` parallel writers. Every `--interval` seconds, each writer uploads `--batch` objects of random data in a single `aws s3 cp` call, so the uploads run concurrently. Objects larger than 8 MiB are uploaded as multipart.
+- **Bounded storage.** Each writer keeps a ring of `--keep-count` objects. Every upload replaces an older object, so stored data stays capped while the backend gets steady PUT and DELETE traffic. Deleted space is reclaimed asynchronously by RGW garbage collection or NooBaa, so raw usage can run above the cap for a while.
+- **Verified.** After deploying, the script checks that rounds are completing and reads the newest object back from the bucket. If a round keeps failing, the pod exits, so a broken endpoint or bucket shows up as `CrashLoopBackOff` instead of a pod that looks healthy.
+- **Integrity always on.** Each object's sha256 is part of its key (`workload/<pod>/w<n>/s<slot>-<sha256>.bin`). `--verify-only` downloads every object, checks it against its key, and reports the bucket's history from a `first-write` marker per pod. A missing marker means the bucket was emptied or recreated.
 
 ```bash
-# 1 MiB objects every 5s against NooBaa
-./deploy-s3-workload.sh --backend noobaa
+# defaults: NooBaa, 4 x 4 MiB objects every 5s (~192 MiB/min), 256 MiB kept
+./deploy-s3-workload.sh
 
-# 4 MiB objects every 2s against RGW, keep 500 objects
-./deploy-s3-workload.sh --backend rgw --object-size 4194304 --interval 2 --keep-count 500
+# RGW, heavy: 2 pods x 4 writers x 8 x 16 MiB (multipart), back-to-back, 4 GiB kept
+./deploy-s3-workload.sh --backend rgw -r 2 -w 4 -B 8 -s 16M -i 0 -c 32
 
-# tear down (keeps the namespace)
-./deploy-s3-workload.sh --namespace s3-workload --cleanup
+# check every object after a migration / failover / upgrade (PASS/FAIL)
+./deploy-s3-workload.sh --backend rgw --verify-only
+
+# tear down (the bucket goes with the OBC; the namespace is kept)
+./deploy-s3-workload.sh --cleanup
 ```
+
+The memory limit scales with `--workers` (256Mi + 192Mi per writer), because each writer runs its own AWS CLI. The AWS CLI is set to add checksums only when the server requires them, because the per-request checksums that newer CLIs add by default aren't supported by every S3-compatible store.
 
 ---
 
@@ -198,6 +208,11 @@ Run the same script against the hub and against each managed cluster, logging in
 ./deploy-busybox-statefulset-app.sh -n survive --verify-integrity
 # ... migrate / restore / fail over / recover PVCs / upgrade ...
 ./deploy-busybox-statefulset-app.sh -n survive --verify-only
+
+# object storage: same idea
+./deploy-s3-workload.sh --backend rgw
+# ... upgrade ODF / fail over / restore ...
+./deploy-s3-workload.sh --backend rgw --verify-only
 ```
 
 ## Notes
